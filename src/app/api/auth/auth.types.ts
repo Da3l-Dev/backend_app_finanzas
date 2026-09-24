@@ -1,0 +1,20 @@
+export type RegisterUser = {
+  email?: string;
+  phone?: number;
+  passwordHash?: string;
+  firstName?: string;
+  lastName?: string;
+  displayName?: string;
+  avatarUrl?: string;
+  defaultCurrency?: string;
+  timezone?: string;
+  locale?: string;
+  role?: string;
+  status?: string;
+  emailVerifiedAt?: Date;
+  phoneVerifiedAt?: Date;
+  lastLoginAt?: Date;
+  createdAt?: Date;
+  updatedAt?: Date;
+  deletedAt?: Date;
+};
