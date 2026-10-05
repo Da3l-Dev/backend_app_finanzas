@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "eslint",
     "bot": "tsx --env-file=.env src/app/services/bot.ts",
-    "contract:emit": "prisma contract emit"
+    "contract:emit": "prisma contract emit",
+    "postinstall": "prisma generate"
   },
   "dependencies": {
     "@prisma/client": "^6.19.3",

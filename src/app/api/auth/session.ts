@@ -56,7 +56,7 @@ export function setSessionCookie(
 }
 
 // Obtiene el token desde las cookies de una petición.
-export function getSessionToken(request: Request) {
+function getSessionTokenFromCookie(request: Request) {
   const cookieHeader = request.headers.get("cookie");
 
   if (!cookieHeader) {
@@ -69,6 +69,22 @@ export function getSessionToken(request: Request) {
     .find((item) => item.startsWith(`${SESSION_COOKIE_NAME}=`));
 
   return cookie?.split("=")[1] ?? null;
+}
+
+// 👇 NUEVO: Obtiene el token desde el header Authorization: Bearer
+function getSessionTokenFromBearer(request: Request) {
+  const authHeader = request.headers.get("authorization");
+  if (!authHeader) return null;
+  if (!authHeader.toLowerCase().startsWith("bearer ")) return null;
+  const token = authHeader.slice(7).trim();
+  return token.length > 0 ? token : null;
+}
+
+// 👇 NUEVO: Prioriza Bearer (móvil), fallback a cookie (web)
+export function getSessionToken(request: Request): string | null {
+  return (
+    getSessionTokenFromBearer(request) ?? getSessionTokenFromCookie(request)
+  );
 }
 
 // Busca al usuario dueño de la sesión.

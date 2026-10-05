@@ -1,53 +1,78 @@
-// lib/validations/account.ts
-import { AccountType } from "@prisma/client";
 import { z } from "zod";
 
-export const AccountTypeEnum = z.enum([
+export const ACCOUNT_TYPES = [
   "CASH",
-  "CHECKING",
-  "SAVINGS",
+  "DEBIT_CARD",
   "CREDIT_CARD",
+  "SAVINGS",
   "INVESTMENT",
-  "LOAN",
-  "OTHER",
-]);
-// ⚠️ ajusta estos valores a los que tengas en tu schema.prisma
+] as const;
 
-export const createAccountSchema = z.object({
-  // obligatorios
-  userId: z.string().uuid({ message: "userId debe ser un UUID válido" }),
-  name: z
-    .string()
-    .min(1, "El nombre es obligatorio")
-    .max(80, "Máximo 80 caracteres"),
-  type: z.nativeEnum(AccountType),
+export const createAccountSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(2, "El nombre debe tener al menos 2 caracteres.")
+      .max(40, "El nombre es demasiado largo."),
+    type: z.enum(ACCOUNT_TYPES),
+    currency: z.string().length(3).optional().default("MXN"),
 
-  // opcionales
-  institution: z.string().max(100).optional().nullable(),
-  lastFourDigits: z
-    .string()
-    .regex(/^\d{4}$/, "Deben ser exactamente 4 dígitos")
-    .optional()
-    .nullable(),
-  currency: z
-    .string()
-    .length(3, "La moneda debe ser un código ISO de 3 letras")
-    .default("MXN"),
-  openingBalance: z.number().finite().default(0),
-  creditLimit: z
-    .number()
-    .positive("El límite de crédito debe ser positivo")
-    .optional()
-    .nullable(),
-  color: z
-    .string()
-    .regex(/^#([0-9A-Fa-f]{6})$/, "Color HEX inválido (#RRGGBB)")
-    .optional()
-    .nullable(),
-  icon: z.string().max(50).optional().nullable(),
-  isDefault: z.boolean().default(false),
-  isActive: z.boolean().default(true),
-  includeInNetWorth: z.boolean().default(true),
-});
+    // Solo aplica a CASH, DEBIT_CARD, SAVINGS, INVESTMENT
+    openingBalance: z
+      .number()
+      .nonnegative("El saldo no puede ser negativo.")
+      .optional()
+      .default(0),
+
+    // Solo aplica a CREDIT_CARD
+    creditLimit: z
+      .number()
+      .positive("El límite debe ser mayor a 0.")
+      .optional(),
+
+    // Solo aplica a DEBIT_CARD y CREDIT_CARD
+    institution: z.string().trim().max(40).optional(),
+    lastFourDigits: z
+      .string()
+      .regex(/^\d{4}$/, "Deben ser exactamente 4 dígitos.")
+      .optional(),
+
+    color: z.string().max(20).nullable().optional(),
+    icon: z.string().max(80).nullable().optional(),
+    isDefault: z.boolean().optional(),
+    includeInNetWorth: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    // Tarjeta de crédito requiere límite
+    if (data.type === "CREDIT_CARD" && !data.creditLimit) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["creditLimit"],
+        message: "Las tarjetas de crédito requieren un límite.",
+      });
+    }
+
+    // Efectivo no tiene institución ni últimos 4
+    if (data.type === "CASH" && (data.institution || data.lastFourDigits)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["institution"],
+        message: "El efectivo no tiene institución ni dígitos.",
+      });
+    }
+
+    // Débito y crédito requieren institución
+    if (
+      (data.type === "DEBIT_CARD" || data.type === "CREDIT_CARD") &&
+      !data.institution
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["institution"],
+        message: "Indica la institución (BBVA, Banorte, etc).",
+      });
+    }
+  });
 
 export type CreateAccountInput = z.infer<typeof createAccountSchema>;

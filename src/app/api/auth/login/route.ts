@@ -24,23 +24,13 @@ export async function POST(request: Request) {
 
     const { email, password } = validation.data;
 
-    // Buscamos solo usuarios activos.
     const user = await prisma.user.findFirst({
-      where: {
-        email,
-        status: "ACTIVE",
-        deletedAt: null,
-      },
+      where: { email, status: "ACTIVE", deletedAt: null },
     });
 
-    // Usamos el mismo mensaje para correo y contraseña incorrectos.
-    // Así no revelamos si un correo está registrado.
     if (!user) {
       return NextResponse.json(
-        {
-          status: "error",
-          message: "Correo o contraseña incorrectos.",
-        },
+        { status: "error", message: "Correo o contraseña incorrectos." },
         { status: 401 },
       );
     }
@@ -49,24 +39,16 @@ export async function POST(request: Request) {
 
     if (!passwordMatches) {
       return NextResponse.json(
-        {
-          status: "error",
-          message: "Correo o contraseña incorrectos.",
-        },
+        { status: "error", message: "Correo o contraseña incorrectos." },
         { status: 401 },
       );
     }
 
-    // Creamos sesión segura.
     const session = await createSession(user.id);
 
     await prisma.user.update({
-      where: {
-        id: user.id,
-      },
-      data: {
-        lastLoginAt: new Date(),
-      },
+      where: { id: user.id },
+      data: { lastLoginAt: new Date() },
     });
 
     const response = NextResponse.json({
@@ -80,10 +62,12 @@ export async function POST(request: Request) {
           lastName: user.lastName,
           displayName: user.displayName,
         },
+        // 👇 NUEVO: token también en el body para clientes móviles
+        token: session.token,
       },
     });
 
-    // La cookie se manda al navegador automáticamente.
+    // La cookie sigue funcionando para el frontend web
     setSessionCookie(response, session.token, session.expiresAt);
 
     return response;
@@ -91,10 +75,7 @@ export async function POST(request: Request) {
     console.error("Error al iniciar sesión:", error);
 
     return NextResponse.json(
-      {
-        status: "error",
-        message: "No fue posible iniciar sesión.",
-      },
+      { status: "error", message: "No fue posible iniciar sesión." },
       { status: 500 },
     );
   }
