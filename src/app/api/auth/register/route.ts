@@ -25,6 +25,7 @@ export async function POST(req: Request) {
 
       return Response.json(
         {
+          success: false,
           status: "error",
           message: "Revisa los campos marcados.",
           errors,
@@ -47,6 +48,7 @@ export async function POST(req: Request) {
     if (existingEmail) {
       return Response.json(
         {
+          success: false,
           status: "error",
           message: "No fue posible crear la cuenta.",
           errors: {
@@ -66,7 +68,8 @@ export async function POST(req: Request) {
       if (existingPhone) {
         return Response.json(
           {
-            status: "error",
+            success: false,
+          status: "error",
             message: "No fue posible crear la cuenta.",
             errors: {
               phone: ["Este número telefónico ya está registrado."],
@@ -122,6 +125,7 @@ export async function POST(req: Request) {
 
     return Response.json(
       {
+        success: true,
         status: "ok",
         message: "Cuenta creada correctamente.",
         data: {
@@ -139,6 +143,7 @@ export async function POST(req: Request) {
     ) {
       return Response.json(
         {
+          success: false,
           status: "error",
           message: "No fue posible crear la cuenta.",
           errors: {
@@ -153,7 +158,8 @@ export async function POST(req: Request) {
 
     return Response.json(
       {
-        status: "error",
+        success: false,
+          status: "error",
         message: "Ocurrió un error inesperado al crear la cuenta.",
       },
       { status: 500 },

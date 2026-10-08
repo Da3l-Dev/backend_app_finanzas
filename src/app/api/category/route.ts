@@ -8,7 +8,7 @@ import { prisma } from "@/lib/prisma";
 const CreateCategorySchema = z.object({
   name: z.string().min(2).max(40),
   type: z.enum(["EXPENSE", "INCOME"]),
-  icon: z.string().max(80).optional(),
+  icon: z.string().max(50).optional(),
   color: z.string().max(20).optional(),
 });
 
@@ -17,7 +17,7 @@ export async function POST(request: Request) {
     const user = await getAuthenticatedUser(request);
     if (!user) {
       return NextResponse.json(
-        { status: "error", message: "No autorizado." },
+        { success: false, message: "No autorizado." },
         { status: 401 },
       );
     }
@@ -28,7 +28,7 @@ export async function POST(request: Request) {
     if (!validation.success) {
       return NextResponse.json(
         {
-          status: "error",
+          success: false,
           message: "Revisa los datos de la categoría.",
           errors: validation.error.issues,
         },
@@ -55,10 +55,11 @@ export async function POST(request: Request) {
         code: true,
         parentId: true,
         sortOrder: true,
+        isSystem: true,
       },
     });
 
-    return NextResponse.json({ status: "ok", data: category }, { status: 201 });
+    return NextResponse.json({ success: true, message: "Categoría creada.", data: category }, { status: 201 });
   } catch (error) {
     if (
       error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -66,7 +67,7 @@ export async function POST(request: Request) {
     ) {
       return NextResponse.json(
         {
-          status: "error",
+          success: false,
           message: "Ya tienes una categoría con ese nombre.",
           errors: { name: "Nombre duplicado." },
         },
@@ -76,7 +77,7 @@ export async function POST(request: Request) {
 
     console.error("Error al crear categoría:", error);
     return NextResponse.json(
-      { status: "error", message: "No se pudo crear la categoría." },
+      { success: false, message: "No se pudo crear la categoría." },
       { status: 500 },
     );
   }

@@ -39,7 +39,7 @@ export const createAccountSchema = z
       .optional(),
 
     color: z.string().max(20).nullable().optional(),
-    icon: z.string().max(80).nullable().optional(),
+    icon: z.string().max(50).nullish(),
     isDefault: z.boolean().optional(),
     includeInNetWorth: z.boolean().optional(),
   })

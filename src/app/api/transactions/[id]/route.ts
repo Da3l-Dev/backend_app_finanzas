@@ -1,285 +1,94 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getAuthenticatedUser } from "@/app/api/auth/session";
 import { toDecimal, toNumber } from "@/lib/money";
+import { getAccountBalances } from "@/lib/balances";
+import { fail, internal, invalid, ok } from "@/lib/api-response";
 
-// ═══════════════════════════════════════════════════════════════
-// GET — una transacción
-// ═══════════════════════════════════════════════════════════════
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const user = await getAuthenticatedUser(request);
-  if (!user) {
-    return NextResponse.json(
-      { status: "error", message: "No autorizado." },
-      { status: 401 },
-    );
-  }
-
-  const { id } = await params;
-
-  const tx = await prisma.transaction.findFirst({
-    where: { id, userId: user.id },
-    include: {
-      category: { select: { id: true, name: true, icon: true, color: true } },
-      merchant: { select: { id: true, name: true } },
-      sourceAccount: { select: { id: true, name: true } },
-      targetAccount: { select: { id: true, name: true } },
-    },
-  });
-
-  if (!tx) {
-    return NextResponse.json(
-      { status: "error", message: "Movimiento no encontrado." },
-      { status: 404 },
-    );
-  }
-
-  return NextResponse.json({
-    status: "ok",
-    data: { ...tx, amount: toNumber(tx.amount) },
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════
-// PATCH — actualizar
-// ═══════════════════════════════════════════════════════════════
-const UpdateSchema = z.object({
+type RouteContext = { params: Promise<{ id: string }> };
+const updateSchema = z.object({
   type: z.enum(["EXPENSE", "INCOME"]).optional(),
-  amount: z.number().positive().optional(),
-  categoryId: z.string().uuid().nullable().optional(),
-  sourceAccountId: z.string().uuid().nullable().optional(),
+  amount: z.number().positive().max(999999999).optional(),
+  categoryId: z.uuid().nullable().optional(),
+  sourceAccountId: z.uuid().nullable().optional(),
   description: z.string().max(500).nullable().optional(),
   notes: z.string().max(1000).nullable().optional(),
-  occurredAt: z.string().datetime().optional(),
-});
+  occurredAt: z.iso.datetime().optional(),
+}).strict();
+const transactionSelect = {
+  id: true, userId: true, type: true, amount: true, occurredAt: true, description: true, notes: true,
+  categoryId: true, sourceAccountId: true, targetAccountId: true,
+  category: { select: { id: true, name: true, icon: true, color: true } },
+  merchant: { select: { id: true, name: true } },
+  sourceAccount: { select: { id: true, name: true } },
+  targetAccount: { select: { id: true, name: true } },
+} as const;
 
-export async function PATCH(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function GET(request: Request, { params }: RouteContext) {
   try {
-    const user = await getAuthenticatedUser(request);
-    if (!user) {
-      return NextResponse.json(
-        { status: "error", message: "No autorizado." },
-        { status: 401 },
-      );
-    }
-
+    const auth = await getAuthenticatedUser(request);
+    if (!auth) return fail("No autorizado.", 401);
     const { id } = await params;
+    const transaction = await prisma.transaction.findFirst({ where: { id, userId: auth.id, voidedAt: null }, select: transactionSelect });
+    return transaction ? ok({ ...transaction, amount: toNumber(transaction.amount) }) : fail("Movimiento no encontrado.", 404);
+  } catch (error) { return internal(error); }
+}
 
-    // Verificar que la transacción existe y es del usuario
-    const existing = await prisma.transaction.findFirst({
-      where: { id, userId: user.id, voidedAt: null },
-      select: {
-        id: true,
-        type: true,
-        sourceAccountId: true,
-        categoryId: true,
-      },
-    });
-
-    if (!existing) {
-      return NextResponse.json(
-        { status: "error", message: "Movimiento no encontrado." },
-        { status: 404 },
-      );
+export async function PATCH(request: Request, { params }: RouteContext) {
+  try {
+    const auth = await getAuthenticatedUser(request);
+    if (!auth) return fail("No autorizado.", 401);
+    const { id } = await params;
+    const parsed = updateSchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) return invalid(parsed.error);
+    const original = await prisma.transaction.findFirst({ where: { id, userId: auth.id, voidedAt: null }, select: { id: true, type: true, amount: true, sourceAccountId: true, categoryId: true } });
+    if (!original) return fail("Movimiento no encontrado.", 404);
+    if (original.type !== "INCOME" && original.type !== "EXPENSE") return fail("Este tipo de movimiento no se puede editar desde la app.", 400);
+    const newType = parsed.data.type ?? original.type;
+    const newAmount = parsed.data.amount ?? Number(original.amount);
+    const newAccountId = parsed.data.sourceAccountId === undefined ? original.sourceAccountId : parsed.data.sourceAccountId;
+    const newCategoryId = parsed.data.categoryId === undefined ? original.categoryId : parsed.data.categoryId;
+    if (!newAccountId) return fail("Selecciona una cuenta.", 400, { sourceAccountId: "Campo obligatorio." });
+    const account = await prisma.account.findFirst({ where: { id: newAccountId, userId: auth.id, archivedAt: null }, select: { id: true, openingBalance: true, creditLimit: true, type: true } });
+    if (!account) return fail("Cuenta no válida o archivada.", 400, { sourceAccountId: "Cuenta no disponible." });
+    if (newCategoryId) {
+      const category = await prisma.category.findFirst({ where: { id: newCategoryId, userId: auth.id }, select: { id: true, type: true, isActive: true } });
+      if (!category || category.type !== newType || (!category.isActive && newCategoryId !== original.categoryId)) return fail("Categoría no válida para el tipo elegido.", 400, { categoryId: "Selecciona otra categoría." });
     }
-
-    const body = await request.json().catch(() => null);
-    const validation = UpdateSchema.safeParse(body);
-
-    if (!validation.success) {
-      return NextResponse.json(
-        {
-          status: "error",
-          message: "Revisa los datos.",
-          errors: validation.error.issues,
-        },
-        { status: 400 },
-      );
+    if (newType === "EXPENSE") {
+      const balances = await getAccountBalances(auth.id, [account], original.id);
+      const balance = balances.get(account.id) ?? Number(account.openingBalance);
+      const available = account.type === "CREDIT_CARD" ? Number(account.creditLimit ?? 0) + Math.min(0, balance) : balance;
+      if (newAmount > available + 0.00001) return fail(`Saldo o crédito insuficiente (${available.toFixed(2)}).`, 400, { amount: "Monto mayor al disponible." });
     }
-
-    const data = validation.data;
-
-    // Validaciones de seguridad por si cambian monto o cuenta
-    const nuevoMonto = data.amount;
-    const nuevaCuentaId = data.sourceAccountId ?? existing.sourceAccountId;
-    const nuevoTipo = data.type ?? existing.type;
-
-    // Si es gasto y hay cuenta, verificar saldo (excluyendo esta misma tx)
-    if (nuevoTipo === "EXPENSE" && nuevaCuentaId && nuevoMonto !== undefined) {
-      const account = await prisma.account.findFirst({
-        where: { id: nuevaCuentaId, userId: user.id, archivedAt: null },
-        select: {
-          id: true,
-          type: true,
-          openingBalance: true,
-          creditLimit: true,
-        },
-      });
-      if (!account) {
-        return NextResponse.json(
-          { status: "error", message: "Cuenta no válida." },
-          { status: 400 },
-        );
-      }
-
-      // Traer todas las transacciones de esta cuenta (menos la que estamos editando)
-      const txs = await prisma.transaction.findMany({
-        where: {
-          userId: user.id,
-          voidedAt: null,
-          id: { not: id },
-          OR: [
-            { sourceAccountId: nuevaCuentaId },
-            { targetAccountId: nuevaCuentaId },
-          ],
-        },
-        select: {
-          type: true,
-          amount: true,
-          sourceAccountId: true,
-          targetAccountId: true,
-        },
-      });
-
-      let balance = Number(account.openingBalance);
-      for (const t of txs) {
-        const amt = Number(t.amount);
-        if (t.type === "EXPENSE" && t.sourceAccountId === nuevaCuentaId) {
-          balance -= amt;
-        } else if (t.type === "INCOME" && t.sourceAccountId === nuevaCuentaId) {
-          balance += amt;
-        } else if (
-          (t.type === "TRANSFER" || t.type === "CREDIT_CARD_PAYMENT") &&
-          t.sourceAccountId === nuevaCuentaId
-        ) {
-          balance -= amt;
-        } else if (
-          (t.type === "TRANSFER" || t.type === "CREDIT_CARD_PAYMENT") &&
-          t.targetAccountId === nuevaCuentaId
-        ) {
-          balance += amt;
-        }
-      }
-
-      if (account.type === "CREDIT_CARD") {
-        const creditAvailable = Math.max(
-          0,
-          (Number(account.creditLimit) ?? 0) - Math.abs(Math.min(0, balance)),
-        );
-        if (nuevoMonto > creditAvailable) {
-          return NextResponse.json(
-            {
-              status: "error",
-              message: `Excedes el crédito disponible ($${creditAvailable.toFixed(2)}).`,
-              errors: { amount: "Monto excede el crédito." },
-            },
-            { status: 400 },
-          );
-        }
-      } else {
-        if (nuevoMonto > Math.max(0, balance)) {
-          return NextResponse.json(
-            {
-              status: "error",
-              message: `Saldo insuficiente ($${Math.max(0, balance).toFixed(2)}).`,
-              errors: { amount: "Monto excede el saldo." },
-            },
-            { status: 400 },
-          );
-        }
-      }
-    }
-
     const updated = await prisma.transaction.update({
       where: { id },
       data: {
-        ...(data.type ? { type: data.type } : {}),
-        ...(data.amount !== undefined
-          ? { amount: toDecimal(data.amount) }
-          : {}),
-        ...(data.categoryId !== undefined
-          ? { categoryId: data.categoryId }
-          : {}),
-        ...(data.sourceAccountId !== undefined
-          ? { sourceAccountId: data.sourceAccountId }
-          : {}),
-        ...(data.description !== undefined
-          ? { description: data.description }
-          : {}),
-        ...(data.notes !== undefined ? { notes: data.notes } : {}),
-        ...(data.occurredAt ? { occurredAt: new Date(data.occurredAt) } : {}),
+        type: newType,
+        amount: toDecimal(newAmount),
+        categoryId: newCategoryId,
+        sourceAccountId: newAccountId,
+        ...(parsed.data.description !== undefined ? { description: parsed.data.description } : {}),
+        ...(parsed.data.notes !== undefined ? { notes: parsed.data.notes } : {}),
+        ...(parsed.data.occurredAt ? { occurredAt: new Date(parsed.data.occurredAt) } : {}),
       },
-      include: {
-        category: { select: { id: true, name: true, icon: true, color: true } },
-        sourceAccount: { select: { id: true, name: true } },
-      },
+      select: transactionSelect,
     });
-
-    return NextResponse.json({
-      status: "ok",
-      message: "Movimiento actualizado.",
-      data: { ...updated, amount: toNumber(updated.amount) },
-    });
-  } catch (error) {
-    console.error("Error al actualizar transacción:", error);
-    return NextResponse.json(
-      { status: "error", message: "No se pudo actualizar." },
-      { status: 500 },
-    );
-  }
+    return ok({ ...updated, amount: toNumber(updated.amount) }, "Movimiento actualizado.");
+  } catch (error) { return internal(error); }
 }
+export const PUT = PATCH;
 
-// ═══════════════════════════════════════════════════════════════
-// DELETE — anular (soft delete)
-// ═══════════════════════════════════════════════════════════════
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
-  const user = await getAuthenticatedUser(request);
-  if (!user) {
-    return NextResponse.json(
-      { status: "error", message: "No autorizado." },
-      { status: 401 },
-    );
-  }
-
-  const { id } = await params;
-
-  const tx = await prisma.transaction.findFirst({
-    where: { id, userId: user.id },
-    select: { id: true, voidedAt: true },
-  });
-
-  if (!tx) {
-    return NextResponse.json(
-      { status: "error", message: "Movimiento no encontrado." },
-      { status: 404 },
-    );
-  }
-
-  if (tx.voidedAt) {
-    return NextResponse.json(
-      { status: "error", message: "Ya estaba anulado." },
-      { status: 409 },
-    );
-  }
-
-  await prisma.transaction.update({
-    where: { id },
-    data: { status: "VOIDED", voidedAt: new Date() },
-  });
-
-  return NextResponse.json({
-    status: "ok",
-    message: "Movimiento anulado.",
-  });
+export async function DELETE(request: Request, { params }: RouteContext) {
+  try {
+    const auth = await getAuthenticatedUser(request);
+    if (!auth) return fail("No autorizado.", 401);
+    const { id } = await params;
+    const existing = await prisma.transaction.findFirst({ where: { id, userId: auth.id, voidedAt: null }, select: { id: true, goalContribution: { select: { id: true } }, debtPayment: { select: { id: true } } } });
+    if (!existing) return fail("Movimiento no encontrado o anulado.", 404);
+    if (existing.goalContribution || existing.debtPayment) return fail("Este movimiento está relacionado con una meta o deuda; debes gestionarlo desde su módulo.", 409);
+    await prisma.transaction.update({ where: { id }, data: { status: "VOIDED", voidedAt: new Date() }, select: { id: true } });
+    return ok({ id, voided: true }, "Movimiento anulado.");
+  } catch (error) { return internal(error); }
 }

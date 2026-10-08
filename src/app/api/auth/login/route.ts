@@ -14,6 +14,7 @@ export async function POST(request: Request) {
     if (!validation.success) {
       return NextResponse.json(
         {
+          success: false,
           status: "error",
           message: "Revisa los datos enviados.",
           errors: validation.error.issues,
@@ -30,7 +31,8 @@ export async function POST(request: Request) {
 
     if (!user) {
       return NextResponse.json(
-        { status: "error", message: "Correo o contraseña incorrectos." },
+        { success: false,
+          status: "error", message: "Correo o contraseña incorrectos." },
         { status: 401 },
       );
     }
@@ -39,7 +41,8 @@ export async function POST(request: Request) {
 
     if (!passwordMatches) {
       return NextResponse.json(
-        { status: "error", message: "Correo o contraseña incorrectos." },
+        { success: false,
+          status: "error", message: "Correo o contraseña incorrectos." },
         { status: 401 },
       );
     }
@@ -52,7 +55,8 @@ export async function POST(request: Request) {
     });
 
     const response = NextResponse.json({
-      status: "ok",
+      success: true,
+        status: "ok",
       message: "Inicio de sesión correcto.",
       data: {
         user: {
@@ -75,7 +79,8 @@ export async function POST(request: Request) {
     console.error("Error al iniciar sesión:", error);
 
     return NextResponse.json(
-      { status: "error", message: "No fue posible iniciar sesión." },
+      { success: false,
+          status: "error", message: "No fue posible iniciar sesión." },
       { status: 500 },
     );
   }

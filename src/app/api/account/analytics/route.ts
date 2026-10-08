@@ -1,3 +1,4 @@
+import { getAccountBalances } from "@/lib/balances";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getAuthenticatedUser } from "@/app/api/auth/session";
@@ -91,50 +92,8 @@ export async function GET(request: Request) {
       },
     });
 
-    // Todas las transacciones históricas para calcular balance real
-    const allTx = await prisma.transaction.findMany({
-      where: { userId: user.id, voidedAt: null },
-      select: {
-        type: true,
-        amount: true,
-        sourceAccountId: true,
-        targetAccountId: true,
-      },
-    });
-
-    // ─── 4. Balance actual por cuenta ───────────
-    const balanceMap = new Map<string, number>();
-    for (const a of accounts) {
-      balanceMap.set(a.id, Number(a.openingBalance));
-    }
-
-    for (const t of allTx) {
-      const amt = Number(t.amount);
-      if (t.type === "EXPENSE" && t.sourceAccountId) {
-        balanceMap.set(
-          t.sourceAccountId,
-          (balanceMap.get(t.sourceAccountId) ?? 0) - amt,
-        );
-      } else if (t.type === "INCOME" && t.sourceAccountId) {
-        balanceMap.set(
-          t.sourceAccountId,
-          (balanceMap.get(t.sourceAccountId) ?? 0) + amt,
-        );
-      } else if (
-        (t.type === "TRANSFER" || t.type === "CREDIT_CARD_PAYMENT") &&
-        t.sourceAccountId &&
-        t.targetAccountId
-      ) {
-        balanceMap.set(
-          t.sourceAccountId,
-          (balanceMap.get(t.sourceAccountId) ?? 0) - amt,
-        );
-        balanceMap.set(
-          t.targetAccountId,
-          (balanceMap.get(t.targetAccountId) ?? 0) + amt,
-        );
-      }
-    }
+    // Saldo histórico agregado en PostgreSQL (sin traer todas las filas).
+    const balanceMap = await getAccountBalances(user.id, accounts);
 
     // ─── 5. Métricas por cuenta ─────────────────
     type AccountMetric = {

@@ -1,3 +1,4 @@
+import { getAccountBalances } from "@/lib/balances";
 import {
   TransactionType,
   TransactionStatus,
@@ -18,7 +19,7 @@ const CreateTransactionSchema = z.object({
     "CREDIT_CARD_PAYMENT",
     "ADJUSTMENT",
   ]),
-  amount: z.number().positive(),
+  amount: z.number().positive().max(999999999),
   categoryId: z.string().uuid().optional(),
   sourceAccountId: z.string().uuid().optional(),
   targetAccountId: z.string().uuid().optional(),
@@ -32,7 +33,7 @@ export async function POST(request: Request) {
   const user = await getAuthenticatedUser(request);
   if (!user) {
     return NextResponse.json(
-      { status: "error", message: "No autorizado." },
+      { success: false, message: "No autorizado." },
       { status: 401 },
     );
   }
@@ -43,7 +44,7 @@ export async function POST(request: Request) {
   if (!validation.success) {
     return NextResponse.json(
       {
-        status: "error",
+        success: false,
         message: "Revisa los datos enviados.",
         errors: validation.error.issues,
       },
@@ -60,7 +61,7 @@ export async function POST(request: Request) {
   ) {
     return NextResponse.json(
       {
-        status: "error",
+        success: false,
         message: "Una transferencia requiere cuenta origen y destino.",
       },
       { status: 400 },
@@ -72,7 +73,7 @@ export async function POST(request: Request) {
     !data.sourceAccountId
   ) {
     return NextResponse.json(
-      { status: "error", message: "Selecciona una cuenta." },
+      { success: false, message: "Selecciona una cuenta." },
       { status: 400 },
     );
   }
@@ -81,11 +82,11 @@ export async function POST(request: Request) {
   if (data.categoryId) {
     const cat = await prisma.category.findFirst({
       where: { id: data.categoryId, userId: user.id },
-      select: { id: true, type: true },
+      select: { id: true, type: true, isActive: true },
     });
-    if (!cat) {
+    if (!cat || !cat.isActive) {
       return NextResponse.json(
-        { status: "error", message: "Categoría no válida." },
+        { success: false, message: "Categoría no válida." },
         { status: 400 },
       );
     }
@@ -95,7 +96,7 @@ export async function POST(request: Request) {
     ) {
       return NextResponse.json(
         {
-          status: "error",
+          success: false,
           message: "La categoría no corresponde al tipo de transacción.",
         },
         { status: 400 },
@@ -106,13 +107,19 @@ export async function POST(request: Request) {
   if (data.sourceAccountId) {
     const acc = await prisma.account.findFirst({
       where: { id: data.sourceAccountId, userId: user.id, archivedAt: null },
-      select: { id: true },
+      select: { id: true, openingBalance: true, creditLimit: true, type: true },
     });
     if (!acc) {
       return NextResponse.json(
-        { status: "error", message: "Cuenta origen no válida." },
+        { success: false, message: "Cuenta origen no válida." },
         { status: 400 },
       );
+    }
+    if (data.type === "EXPENSE") {
+      const balances = await getAccountBalances(user.id, [acc]);
+      const balance = balances.get(acc.id) ?? Number(acc.openingBalance);
+      const available = acc.type === "CREDIT_CARD" ? Number(acc.creditLimit ?? 0) + Math.min(0, balance) : balance;
+      if (data.amount > available + 0.00001) return NextResponse.json({ success: false, message: "Saldo o crédito insuficiente.", errors: { amount: "Monto mayor al disponible." } }, { status: 400 });
     }
   }
 
@@ -123,7 +130,7 @@ export async function POST(request: Request) {
     });
     if (!acc) {
       return NextResponse.json(
-        { status: "error", message: "Cuenta destino no válida." },
+        { success: false, message: "Cuenta destino no válida." },
         { status: 400 },
       );
     }
@@ -163,7 +170,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json(
       {
-        status: "ok",
+        success: true,
         message: "Transacción registrada.",
         data: {
           ...created,
@@ -175,7 +182,7 @@ export async function POST(request: Request) {
   } catch (error) {
     console.error("Error creando transacción:", error);
     return NextResponse.json(
-      { status: "error", message: "No fue posible registrar la transacción." },
+      { success: false, message: "No fue posible registrar la transacción." },
       { status: 500 },
     );
   }
@@ -186,7 +193,8 @@ export async function POST(request: Request) {
 const ListQuerySchema = z.object({
   from: z.string().optional(),
   to: z.string().optional(),
-  type: z.string().optional(),
+  type: z.enum(["EXPENSE", "INCOME", "TRANSFER", "CREDIT_CARD_PAYMENT", "ADJUSTMENT"]).optional(),
+  search: z.string().trim().max(100).optional(),
   categoryId: z.string().uuid().optional(),
   accountId: z.string().uuid().optional(),
   take: z.coerce.number().int().min(1).max(200).optional().default(50),
@@ -197,7 +205,7 @@ export async function GET(request: Request) {
   const user = await getAuthenticatedUser(request);
   if (!user) {
     return NextResponse.json(
-      { status: "error", message: "No autorizado." },
+      { success: false, message: "No autorizado." },
       { status: 401 },
     );
   }
@@ -209,12 +217,15 @@ export async function GET(request: Request) {
 
   if (!parsed.success) {
     return NextResponse.json(
-      { status: "error", message: "Parámetros inválidos." },
+      { success: false, message: "Parámetros inválidos." },
       { status: 400 },
     );
   }
 
-  const { from, to, type, categoryId, accountId, take, skip } = parsed.data;
+  const { from, to, type, categoryId, accountId, take, skip, search } = parsed.data;
+  if ((from && Number.isNaN(Date.parse(from))) || (to && Number.isNaN(Date.parse(to)))) {
+    return NextResponse.json({ success: false, message: "Fechas inválidas." }, { status: 400 });
+  }
 
   const where = {
     userId: user.id,
@@ -228,6 +239,7 @@ export async function GET(request: Request) {
         }
       : {}),
     ...(type ? { type: type as TransactionType } : {}),
+    ...(search ? { AND: [{ OR: [{ description: { contains: search, mode: "insensitive" as const } }, { merchant: { name: { contains: search, mode: "insensitive" as const } } }] }] } : {}),
     ...(categoryId ? { categoryId } : {}),
     ...(accountId
       ? {
@@ -239,7 +251,7 @@ export async function GET(request: Request) {
   const [items, total] = await Promise.all([
     prisma.transaction.findMany({
       where,
-      orderBy: { occurredAt: "desc" },
+      orderBy: [{ occurredAt: "desc" }, { id: "desc" }],
       take,
       skip,
       include: {
@@ -253,7 +265,7 @@ export async function GET(request: Request) {
   ]);
 
   return NextResponse.json({
-    status: "ok",
+    success: true,
     data: {
       items: items.map((t) => ({ ...t, amount: toNumber(t.amount) })),
       total,

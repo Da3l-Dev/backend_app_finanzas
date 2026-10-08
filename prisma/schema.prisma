@@ -302,6 +302,8 @@ model Transaction {
 
   @@unique([userId, origin, externalReference])
   @@index([userId, occurredAt])
+  @@index([userId, type, occurredAt])
+  @@index([userId, createdAt])
   @@index([sourceAccountId, occurredAt])
   @@index([targetAccountId, occurredAt])
   @@index([categoryId, occurredAt])

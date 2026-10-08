@@ -3,257 +3,144 @@ import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getAuthenticatedUser } from "@/app/api/auth/session";
+import { fail, internal, invalid, ok } from "@/lib/api-response";
 
-// ═══════════════════════════════════════════════════════════════
-// GET /api/account/[id] — Obtener una cuenta
-// ═══════════════════════════════════════════════════════════════
-export async function GET(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
+type Context = { params: Promise<{ id: string }> };
+const editSchema = z.object({
+  name: z.string().trim().min(2).max(40).optional(),
+  type: z.enum(["CASH", "DEBIT_CARD", "CREDIT_CARD", "SAVINGS", "INVESTMENT"]).optional(),
+  openingBalance: z.number().nonnegative().max(999999999).optional(),
+  color: z.string().max(20).nullish(),
+  icon: z.string().max(50).nullish(),
+  institution: z.string().trim().max(40).nullish(),
+  lastFourDigits: z.union([z.string().regex(/^\d{4}$/), z.null()]).optional(),
+  isDefault: z.boolean().optional(),
+  includeInNetWorth: z.boolean().optional(),
+  creditLimit: z.number().positive().nullable().optional(),
+  restore: z.boolean().optional(),
+}).strict();
+
+export async function GET(request: Request, { params }: Context) {
   try {
     const user = await getAuthenticatedUser(request);
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "No autorizado." },
-        { status: 401 },
-      );
-    }
-
+    if (!user) return fail("No autorizado.", 401);
     const { id } = await params;
-
     const account = await prisma.account.findFirst({
       where: { id, userId: user.id },
       select: {
-        id: true,
-        name: true,
-        type: true,
-        currency: true,
-        institution: true,
-        lastFourDigits: true,
-        openingBalance: true,
-        creditLimit: true,
-        color: true,
-        icon: true,
-        isDefault: true,
-        isActive: true,
-        includeInNetWorth: true,
-        createdAt: true,
-        updatedAt: true,
+        id: true, name: true, type: true, currency: true, institution: true,
+        lastFourDigits: true, openingBalance: true, creditLimit: true,
+        color: true, icon: true, isDefault: true, isActive: true,
+        includeInNetWorth: true, archivedAt: true, createdAt: true, updatedAt: true,
       },
     });
-
-    if (!account) {
-      return NextResponse.json(
-        { success: false, message: "Cuenta no encontrada." },
-        { status: 404 },
-      );
-    }
-
-    return NextResponse.json({
-      success: true,
-      data: {
-        ...account,
-        openingBalance: Number(account.openingBalance),
-        creditLimit: account.creditLimit ? Number(account.creditLimit) : null,
-      },
+    if (!account) return fail("Cuenta no encontrada.", 404);
+    return ok({
+      ...account,
+      openingBalance: Number(account.openingBalance),
+      creditLimit: account.creditLimit === null ? null : Number(account.creditLimit),
     });
-  } catch (error) {
-    console.error("Error al obtener cuenta:", error);
-    return NextResponse.json(
-      { success: false, message: "No se pudo cargar la cuenta." },
-      { status: 500 },
-    );
-  }
+  } catch (error) { return internal(error); }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// PATCH /api/account/[id] — Actualizar cuenta
-// ═══════════════════════════════════════════════════════════════
-const UpdateAccountSchema = z.object({
-  name: z.string().trim().min(2).max(40).optional(),
-  color: z.string().max(20).nullable().optional(),
-  icon: z.string().max(80).nullable().optional(),
-  institution: z.string().trim().max(40).nullable().optional(),
-  lastFourDigits: z
-    .string()
-    .regex(/^\d{4}$/)
-    .nullable()
-    .optional(),
-  isDefault: z.boolean().optional(),
-  isActive: z.boolean().optional(),
-  includeInNetWorth: z.boolean().optional(),
-  creditLimit: z.number().positive().nullable().optional(),
-});
-
-export async function PATCH(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
+export async function PATCH(request: Request, { params }: Context) {
   try {
     const user = await getAuthenticatedUser(request);
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "No autorizado." },
-        { status: 401 },
-      );
-    }
-
+    if (!user) return fail("No autorizado.", 401);
     const { id } = await params;
-
+    const parsed = editSchema.safeParse(await request.json().catch(() => null));
+    if (!parsed.success) return invalid(parsed.error);
     const existing = await prisma.account.findFirst({
       where: { id, userId: user.id },
-      select: { id: true },
+      select: { id: true, isDefault: true, archivedAt: true },
     });
-
-    if (!existing) {
-      return NextResponse.json(
-        { success: false, message: "Cuenta no encontrada." },
-        { status: 404 },
-      );
-    }
-
-    const body = await request.json().catch(() => null);
-    const validation = UpdateAccountSchema.safeParse(body);
-
-    if (!validation.success) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Revisa los datos.",
-          errors: validation.error.issues,
+    if (!existing) return fail("Cuenta no encontrada.", 404);
+    const { restore, ...changes } = parsed.data;
+    if (Object.keys(changes).length === 0 && !restore) return fail("No se enviaron cambios.", 400);
+    const updated = await prisma.$transaction(async (tx) => {
+      if (changes.isDefault === true) {
+        await tx.account.updateMany({ where: { userId: user.id, isDefault: true, id: { not: id } }, data: { isDefault: false } });
+      }
+      return tx.account.update({
+        where: { id },
+        data: {
+          ...changes,
+          ...(restore ? { archivedAt: null, isActive: true } : {}),
         },
-        { status: 400 },
-      );
-    }
-
-    const updated = await prisma.account.update({
-      where: { id },
-      data: validation.data,
-      select: {
-        id: true,
-        name: true,
-        type: true,
-        openingBalance: true,
-        creditLimit: true,
-        color: true,
-        icon: true,
-        isDefault: true,
-      },
+        select: {
+          id: true, name: true, type: true, currency: true, institution: true,
+          lastFourDigits: true, openingBalance: true, creditLimit: true,
+          icon: true, color: true, isDefault: true, isActive: true,
+          includeInNetWorth: true, archivedAt: true, createdAt: true,
+        },
+      });
     });
-
-    return NextResponse.json({
-      success: true,
-      message: "Cuenta actualizada.",
-      data: {
-        ...updated,
-        openingBalance: Number(updated.openingBalance),
-        creditLimit: updated.creditLimit ? Number(updated.creditLimit) : null,
-      },
-    });
+    return ok({
+      ...updated,
+      openingBalance: Number(updated.openingBalance),
+      creditLimit: updated.creditLimit === null ? null : Number(updated.creditLimit),
+    }, restore ? "Cuenta restaurada." : "Cuenta actualizada.");
   } catch (error) {
-    if (
-      error instanceof Prisma.PrismaClientKnownRequestError &&
-      error.code === "P2002"
-    ) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Ya tienes una cuenta con ese nombre.",
-          errors: { name: "Nombre duplicado." },
-        },
-        { status: 409 },
-      );
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+      return fail("Ya existe otra cuenta con ese nombre.", 409, { name: "Nombre duplicado." });
     }
-    console.error("Error al actualizar cuenta:", error);
-    return NextResponse.json(
-      { success: false, message: "No se pudo actualizar." },
-      { status: 500 },
-    );
+    return internal(error);
   }
 }
+export const PUT = PATCH;
 
-// ═══════════════════════════════════════════════════════════════
-// DELETE /api/account/[id] — Archivar cuenta (soft delete)
-// ═══════════════════════════════════════════════════════════════
-export async function DELETE(
-  request: Request,
-  { params }: { params: Promise<{ id: string }> },
-) {
+// DELETE real. Si hay movimientos, exige ?force=true y una confirmación adicional desde la app.
+export async function DELETE(request: Request, { params }: Context) {
   try {
     const user = await getAuthenticatedUser(request);
-    if (!user) {
-      return NextResponse.json(
-        { success: false, message: "No autorizado." },
-        { status: 401 },
-      );
-    }
-
+    if (!user) return fail("No autorizado.", 401);
     const { id } = await params;
-
-    // 1. Verificar que la cuenta existe y pertenece al usuario
     const existing = await prisma.account.findFirst({
-      where: { id, userId: user.id, archivedAt: null },
+      where: { id, userId: user.id },
       select: { id: true, isDefault: true },
     });
+    if (!existing) return fail("Cuenta no encontrada.", 404);
 
-    if (!existing) {
-      return NextResponse.json(
-        { success: false, message: "Cuenta no encontrada." },
-        { status: 404 },
+    const force = new URL(request.url).searchParams.get("force") === "true";
+    const referenceWhere = { userId: user.id, OR: [{ sourceAccountId: id }, { targetAccountId: id }] };
+    const transactions = await prisma.transaction.count({ where: referenceWhere });
+    if (transactions > 0 && !force) {
+      return fail(
+        `Esta cuenta tiene ${transactions} movimiento(s). Para borrarla definitivamente también deberás eliminar esos movimientos.`,
+        409,
+        { transactions: String(transactions), requiresConfirmation: "true" },
       );
     }
 
-    // 2. No permitir borrar la última cuenta activa
-    const activeCount = await prisma.account.count({
-      where: { userId: user.id, archivedAt: null },
-    });
-
-    if (activeCount <= 1) {
-      return NextResponse.json(
-        {
-          success: false,
-          message: "Debes tener al menos una cuenta activa.",
-        },
-        { status: 400 },
-      );
-    }
-
-    // 3. Soft delete + limpiar flag de default
-    await prisma.account.update({
-      where: { id },
-      data: {
-        archivedAt: new Date(),
-        isActive: false,
-        isDefault: false,
-      },
-    });
-
-    // 4. Si era la default, promover la más antigua como nueva default
-    if (existing.isDefault) {
-      const next = await prisma.account.findFirst({
-        where: { userId: user.id, archivedAt: null },
-        orderBy: { createdAt: "asc" },
-        select: { id: true },
-      });
-
-      if (next) {
-        await prisma.account.update({
-          where: { id: next.id },
-          data: { isDefault: true },
-        });
+    await prisma.$transaction(async (tx) => {
+      // El usuario autoriza explícitamente la destrucción de los movimientos dependientes.
+      if (force && transactions > 0) {
+        const ids = (await tx.transaction.findMany({
+          where: referenceWhere,
+          select: { id: true },
+        })).map((item) => item.id);
+        if (ids.length > 0) {
+          await tx.goalContribution.deleteMany({ where: { transactionId: { in: ids } } });
+          await tx.debtPayment.deleteMany({ where: { transactionId: { in: ids } } });
+          // Los desgloses TransactionSplit se eliminan mediante CASCADE.
+          await tx.transaction.deleteMany({ where: { id: { in: ids }, userId: user.id } });
+        }
       }
-    }
-
-    return NextResponse.json({
-      success: true,
-      message: "Cuenta eliminada correctamente.",
+      await tx.account.delete({ where: { id, userId: user.id } });
+      if (existing.isDefault) {
+        const next = await tx.account.findFirst({
+          where: { userId: user.id, archivedAt: null, isActive: true },
+          orderBy: { createdAt: "asc" },
+          select: { id: true },
+        });
+        if (next) await tx.account.update({ where: { id: next.id }, data: { isDefault: true } });
+      }
     });
+    return ok({ id, deleted: true, deletedTransactions: force ? transactions : 0 }, "Cuenta eliminada definitivamente de la base de datos.");
   } catch (error) {
-    console.error("Error al eliminar cuenta:", error);
-    return NextResponse.json(
-      { success: false, message: "No se pudo eliminar la cuenta." },
-      { status: 500 },
-    );
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2003") {
+      return fail("La cuenta todavía tiene registros asociados que impiden eliminarla. Vuelve a intentar o revisa los movimientos.", 409);
+    }
+    return internal(error);
   }
 }

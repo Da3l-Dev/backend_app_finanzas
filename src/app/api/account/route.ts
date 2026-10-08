@@ -1,3 +1,4 @@
+import { getAccountBalances } from "@/lib/balances";
 import { NextResponse } from "next/server";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
@@ -146,10 +147,10 @@ export async function GET(request: Request) {
       );
     }
 
-    // Traer cuentas y transacciones en paralelo
-    const [accounts, transactions] = await Promise.all([
-      prisma.account.findMany({
-        where: { userId: user.id, archivedAt: null },
+    // Recupera también cuentas archivadas solo cuando se solicita expresamente.
+    const includeArchived = new URL(request.url).searchParams.get("includeArchived") === "true";
+    const accounts = await prisma.account.findMany({
+        where: { userId: user.id, ...(includeArchived ? {} : { archivedAt: null }) },
         orderBy: [{ isDefault: "desc" }, { createdAt: "asc" }],
         select: {
           id: true,
@@ -164,41 +165,13 @@ export async function GET(request: Request) {
           icon: true,
           isDefault: true,
           isActive: true,
+          archivedAt: true,
           includeInNetWorth: true,
           createdAt: true,
         },
-      }),
-      prisma.transaction.findMany({
-        where: { userId: user.id, voidedAt: null },
-        select: {
-          type: true,
-          amount: true,
-          sourceAccountId: true,
-          targetAccountId: true,
-        },
-      }),
-    ]);
+      });
 
-    // Mapa de saldos, arranca en openingBalance
-    const balanceMap = new Map<string, number>();
-    for (const a of accounts) {
-      balanceMap.set(a.id, Number(a.openingBalance));
-    }
-
-    for (const t of transactions) {
-      const amt = Number(t.amount);
-      const src = t.sourceAccountId;
-      const dst = t.targetAccountId;
-
-      if (t.type === "EXPENSE" && src) {
-        balanceMap.set(src, (balanceMap.get(src) ?? 0) - amt);
-      } else if (t.type === "INCOME" && src) {
-        balanceMap.set(src, (balanceMap.get(src) ?? 0) + amt);
-      } else if (t.type === "TRANSFER" || t.type === "CREDIT_CARD_PAYMENT") {
-        if (src) balanceMap.set(src, (balanceMap.get(src) ?? 0) - amt);
-        if (dst) balanceMap.set(dst, (balanceMap.get(dst) ?? 0) + amt);
-      }
-    }
+    const balanceMap = await getAccountBalances(user.id, accounts);
 
     return NextResponse.json({
       success: true,

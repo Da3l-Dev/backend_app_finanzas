@@ -1,3 +1,4 @@
+import { getAccountBalances } from "@/lib/balances";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getAuthenticatedUser } from "@/app/api/auth/session";
@@ -16,10 +17,14 @@ export async function GET(request: Request) {
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
     const startOfNextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
     const startOfWeek = new Date(now);
-    startOfWeek.setDate(now.getDate() - now.getDay()); // domingo
+    startOfWeek.setDate(now.getDate() - now.getDay());
     startOfWeek.setHours(0, 0, 0, 0);
+    const startOfLastWeek = new Date(startOfWeek);
+    startOfLastWeek.setDate(startOfWeek.getDate() - 7);
     const startOfToday = new Date(now);
     startOfToday.setHours(0, 0, 0, 0);
+    const startOfTomorrow = new Date(startOfToday);
+    startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
 
     // ─── 1. Cuentas ──────────────────────────────
     const accounts = await prisma.account.findMany({
@@ -38,84 +43,74 @@ export async function GET(request: Request) {
       },
     });
 
-    // ─── 2. Transacciones del mes en curso ───────
-    const monthTransactions = await prisma.transaction.findMany({
+    // ─── 2. Agregados del mes en curso ───────────
+    // Usamos groupBy en lugar de findMany + loop: más eficiente y menos
+    // propenso a errores con Decimal.
+    const monthAgg = await prisma.transaction.groupBy({
+      by: ["type"],
       where: {
         userId: user.id,
         voidedAt: null,
         occurredAt: { gte: startOfMonth, lt: startOfNextMonth },
       },
-      select: {
-        id: true,
-        type: true,
-        amount: true,
-        occurredAt: true,
-        categoryId: true,
-        sourceAccountId: true,
-      },
+      _sum: { amount: true },
+      _count: { _all: true },
     });
 
     let monthlyIncome = 0;
     let monthlyExpense = 0;
-    const byCategoryMap = new Map<string, { total: number; count: number }>();
-
-    for (const t of monthTransactions) {
-      const amt = Number(t.amount);
-      if (t.type === "INCOME") monthlyIncome += amt;
-      if (t.type === "EXPENSE") {
-        monthlyExpense += amt;
-        if (t.categoryId) {
-          const prev = byCategoryMap.get(t.categoryId) ?? {
-            total: 0,
-            count: 0,
-          };
-          byCategoryMap.set(t.categoryId, {
-            total: prev.total + amt,
-            count: prev.count + 1,
-          });
-        }
-      }
+    let monthCount = 0;
+    for (const agg of monthAgg) {
+      const total = Number(agg._sum.amount ?? 0);
+      monthCount += agg._count._all;
+      if (agg.type === "INCOME") monthlyIncome = total;
+      if (agg.type === "EXPENSE") monthlyExpense = total;
     }
+    const monthlyNet = monthlyIncome - monthlyExpense;
 
-    // ─── 3. Total por cuenta (balance real) ──────
-    // Suma ingresos - gastos por cuenta para calcular el saldo actual.
-    const allTransactionsForBalance = await prisma.transaction.findMany({
-      where: { userId: user.id, voidedAt: null },
-      select: {
-        type: true,
-        amount: true,
-        sourceAccountId: true,
-        targetAccountId: true,
+    // ─── 3. Gastos por categoría del mes ─────────
+    const categoryAgg = await prisma.transaction.groupBy({
+      by: ["categoryId"],
+      where: {
+        userId: user.id,
+        voidedAt: null,
+        type: "EXPENSE",
+        categoryId: { not: null },
+        occurredAt: { gte: startOfMonth, lt: startOfNextMonth },
       },
+      _sum: { amount: true },
+      _count: { _all: true },
     });
 
-    const accountBalanceMap = new Map<string, number>();
-    for (const a of accounts) {
-      accountBalanceMap.set(a.id, Number(a.openingBalance));
-    }
+    const categoryIds = categoryAgg
+      .map((c) => c.categoryId)
+      .filter((id): id is string => !!id);
 
-    for (const t of allTransactionsForBalance) {
-      const amt = Number(t.amount);
-      const src = t.sourceAccountId;
-      const dst = t.targetAccountId;
+    const categories = categoryIds.length
+      ? await prisma.category.findMany({
+          where: { id: { in: categoryIds } },
+          select: { id: true, name: true, color: true, icon: true },
+        })
+      : [];
+    const categoryMap = new Map(categories.map((c) => [c.id, c]));
 
-      if (t.type === "EXPENSE" && src) {
-        accountBalanceMap.set(src, (accountBalanceMap.get(src) ?? 0) - amt);
-      } else if (t.type === "INCOME" && src) {
-        accountBalanceMap.set(src, (accountBalanceMap.get(src) ?? 0) + amt);
-      } else if (t.type === "TRANSFER") {
-        if (src)
-          accountBalanceMap.set(src, (accountBalanceMap.get(src) ?? 0) - amt);
-        if (dst)
-          accountBalanceMap.set(dst, (accountBalanceMap.get(dst) ?? 0) + amt);
-      } else if (t.type === "CREDIT_CARD_PAYMENT") {
-        // Sale de source, entra a target (la tarjeta)
-        if (src)
-          accountBalanceMap.set(src, (accountBalanceMap.get(src) ?? 0) - amt);
-        if (dst)
-          accountBalanceMap.set(dst, (accountBalanceMap.get(dst) ?? 0) + amt);
-      }
-    }
+    const spendingByCategory = categoryAgg
+      .map((agg) => {
+        const cat = agg.categoryId ? categoryMap.get(agg.categoryId) : null;
+        return {
+          categoryId: agg.categoryId ?? "unknown",
+          name: cat?.name ?? "Sin categoría",
+          color: cat?.color ?? null,
+          icon: cat?.icon ?? null,
+          total: Number(agg._sum.amount ?? 0),
+          count: agg._count._all,
+        };
+      })
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 5);
+
+    // ─── 4. Balance real por cuenta ──────────────
+    const accountBalanceMap = await getAccountBalances(user.id, accounts);
 
     const accountsWithBalance = accounts.map((a) => ({
       ...a,
@@ -124,36 +119,14 @@ export async function GET(request: Request) {
       currentBalance: accountBalanceMap.get(a.id) ?? Number(a.openingBalance),
     }));
 
-    // Total: sumamos assets, restamos deuda de tarjetas de crédito
     const totalBalance = accountsWithBalance.reduce((sum, a) => {
       if (a.type === "CREDIT_CARD") {
-        // Saldo negativo en tarjeta = deuda
         return sum + Math.min(0, a.currentBalance);
       }
       return sum + a.currentBalance;
     }, 0);
 
-    // ─── 4. Top categorías de gasto del mes ──────
-    const categoryIds = [...byCategoryMap.keys()];
-    const categories = await prisma.category.findMany({
-      where: { id: { in: categoryIds } },
-      select: { id: true, name: true, color: true, icon: true },
-    });
-    const categoryMap = new Map(categories.map((c) => [c.id, c]));
-
-    const spendingByCategory = [...byCategoryMap.entries()]
-      .map(([catId, data]) => ({
-        categoryId: catId,
-        name: categoryMap.get(catId)?.name ?? "Sin categoría",
-        color: categoryMap.get(catId)?.color ?? null,
-        icon: categoryMap.get(catId)?.icon ?? null,
-        total: data.total,
-        count: data.count,
-      }))
-      .sort((a, b) => b.total - a.total)
-      .slice(0, 5);
-
-    // ─── 5. Últimas transacciones ─────────────────
+    // ─── 5. Últimas transacciones ────────────────
     const recentTransactions = await prisma.transaction.findMany({
       where: { userId: user.id, voidedAt: null },
       orderBy: { occurredAt: "desc" },
@@ -164,32 +137,37 @@ export async function GET(request: Request) {
         amount: true,
         occurredAt: true,
         description: true,
-        category: { select: { id: true, name: true, color: true, icon: true } },
+        category: {
+          select: { id: true, name: true, color: true, icon: true },
+        },
         sourceAccount: { select: { id: true, name: true } },
       },
     });
 
-    // ─── 6. Comparación con semana anterior ──────
-    const startOfLastWeek = new Date(startOfWeek);
-    startOfLastWeek.setDate(startOfWeek.getDate() - 7);
-
-    const weekTx = await prisma.transaction.findMany({
+    // ─── 6. Comparación de gasto semanal ─────────
+    const weekAgg = await prisma.transaction.groupBy({
+      by: ["type"],
       where: {
         userId: user.id,
         voidedAt: null,
         type: "EXPENSE",
-        occurredAt: { gte: startOfLastWeek, lt: startOfNextMonth },
+        occurredAt: { gte: startOfLastWeek, lt: startOfWeek },
       },
-      select: { amount: true, occurredAt: true },
+      _sum: { amount: true },
     });
+    const lastWeekSpent = Number(weekAgg[0]?._sum.amount ?? 0);
 
-    let thisWeekSpent = 0;
-    let lastWeekSpent = 0;
-    for (const t of weekTx) {
-      const amt = Number(t.amount);
-      if (t.occurredAt >= startOfWeek) thisWeekSpent += amt;
-      else lastWeekSpent += amt;
-    }
+    const thisWeekAgg = await prisma.transaction.groupBy({
+      by: ["type"],
+      where: {
+        userId: user.id,
+        voidedAt: null,
+        type: "EXPENSE",
+        occurredAt: { gte: startOfWeek, lt: startOfNextMonth },
+      },
+      _sum: { amount: true },
+    });
+    const thisWeekSpent = Number(thisWeekAgg[0]?._sum.amount ?? 0);
 
     const weekDelta =
       lastWeekSpent > 0
@@ -197,14 +175,17 @@ export async function GET(request: Request) {
         : null;
 
     // ─── 7. Gasto de hoy ─────────────────────────
-    const todaySpent = monthTransactions
-      .filter(
-        (t) =>
-          t.type === "EXPENSE" &&
-          t.occurredAt >= startOfToday &&
-          t.occurredAt < startOfNextMonth,
-      )
-      .reduce((sum, t) => sum + Number(t.amount), 0);
+    const todayAgg = await prisma.transaction.groupBy({
+      by: ["type"],
+      where: {
+        userId: user.id,
+        voidedAt: null,
+        type: "EXPENSE",
+        occurredAt: { gte: startOfToday, lt: startOfTomorrow },
+      },
+      _sum: { amount: true },
+    });
+    const todaySpent = Number(todayAgg[0]?._sum.amount ?? 0);
 
     return NextResponse.json({
       success: true,
@@ -212,7 +193,8 @@ export async function GET(request: Request) {
         totalBalance,
         monthlyIncome,
         monthlyExpense,
-        monthlyNet: monthlyIncome - monthlyExpense,
+        monthlyNet,
+        monthCount,
         todaySpent,
         thisWeekSpent,
         lastWeekSpent,
